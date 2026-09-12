@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+.pytest_cache/
+*.pyc
+resolveai.db
+*.sqlite
+*.pptx
+generate_deck.py
+submission/
+ResolveAI*Master*Prompt*.md
+Tech_Zephyr_4.0_Agentic_AI_Final_Problem_Statements.pdf
+prompts/
+architecture.png
+architecture.svg
+.DS_Store
