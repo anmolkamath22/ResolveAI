@@ -8,7 +8,10 @@ from demo.failures import FailureInjector
 from reporting import resolution_report
 from providers.llm.factory import build_provider
 from services.enterprise import Enterprise
-from storage.database import DEFAULT_DB,connect,ensure_database,reset_database
+from storage.database import connect,ensure_database,reset_database
+from app.settings import settings
+
+DB_PATH=settings.database_path
 
 st.set_page_config(page_title="ResolveAI",page_icon="✦",layout="wide")
 st.markdown("""<style>
@@ -16,10 +19,10 @@ st.markdown("""<style>
 :root{--ink:#eaf2fb;--muted:#91a5bc;--canvas:#07131f;--panel:#0d2033;--panel2:#10283e;--line:#1b3b56;--accent:#38d6b0;--blue:#54a9ff;--amber:#f7b955;--danger:#ff6b73}
 html,body,[class*="css"]{font-family:'Manrope',Inter,ui-sans-serif,system-ui,sans-serif}.stApp{background:var(--canvas);color:var(--ink)}[data-testid="stHeader"]{background:rgba(7,19,31,.97);border-bottom:1px solid var(--line)}[data-testid="stToolbar"]{right:1rem}[data-testid="stSidebar"]{background:#091b2c;border-right:1px solid #18354e}[data-testid="stSidebar"] *{color:var(--ink)}.block-container{max-width:1440px;padding:2.2rem 3.2rem 4rem}.brand{font-size:1.55rem;font-weight:800;color:#fff;letter-spacing:-.045em}.sub{color:var(--muted);font-size:.8rem;line-height:1.5}.casebar,.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:1.15rem 1.3rem;margin:.65rem 0;box-shadow:0 8px 30px rgba(0,0,0,.12)}.chip{background:rgba(56,214,176,.14);border:1px solid rgba(56,214,176,.28);color:#78efd2;border-radius:999px;padding:.25rem .66rem;font-size:.7rem;font-weight:800;letter-spacing:.06em}.event{border:1px solid var(--line);border-left:3px solid var(--blue);background:var(--panel);padding:.9rem 1rem;margin:.5rem 0;border-radius:0 11px 11px 0}.event-adapt{border-left-color:var(--amber);background:#1c1b18}.event-fail{border-left-color:var(--danger);background:#21181c}.event small{color:var(--muted)}.metric-note{color:var(--muted);font-size:.75rem}h1,h2,h3{color:#f6f9fc;letter-spacing:-.04em}h1{font-size:2rem!important;margin-bottom:.35rem!important}h2{font-size:1.3rem!important}h3{font-size:1.05rem!important}.stCaption{color:var(--muted)!important}label,p,.stMarkdown{color:var(--ink)!important}.stTextArea textarea,.stTextInput input,[data-baseweb="select"]>div{background:#0b1d2e!important;color:var(--ink)!important;border:1px solid #30516e!important;border-radius:10px!important}.stTextArea textarea:focus,.stTextInput input:focus{border-color:var(--accent)!important;box-shadow:0 0 0 2px rgba(56,214,176,.14)!important}.stButton>button{background:var(--panel2);color:var(--ink);border:1px solid #315370;border-radius:9px;font-family:inherit;font-weight:700;padding:.58rem 1rem}.stButton>button:hover{border-color:var(--accent);color:#fff;background:#14334a}.stButton>button[kind="primary"]{background:var(--accent);color:#06231e;border-color:var(--accent)}.stButton>button[kind="primary"]:hover{background:#60e5c6;border-color:#60e5c6}.stSelectbox label,.stMultiSelect label{color:var(--muted)!important;font-size:.82rem!important;font-weight:700!important}.stRadio label{color:#b9cbe0!important}.stRadio [role="radiogroup"]{gap:.15rem}.stRadio [role="radio"]{background:transparent!important}.stRadio [data-checked="true"]{border-color:var(--accent)!important;background:var(--accent)!important}.stMetric{background:var(--panel)!important;border:1px solid var(--line);border-radius:12px;padding:.75rem .9rem}.stMetric label{color:var(--muted)!important;font-size:.72rem!important;font-weight:700!important;text-transform:uppercase;letter-spacing:.06em}.stMetric [data-testid="stMetricValue"]{color:#f3f8fc!important;font-size:1.35rem}.stTabs [data-baseweb="tab-list"]{gap:.25rem;border-bottom:1px solid var(--line)}.stTabs [data-baseweb="tab"]{color:var(--muted);font-weight:700;padding:.65rem .9rem}.stTabs [aria-selected="true"]{color:var(--accent)!important;border-bottom-color:var(--accent)!important}.stDataFrame{border:1px solid var(--line);border-radius:10px;overflow:hidden}.stAlert{border-radius:11px}.demo-hero{background:linear-gradient(135deg,#0e2940,#102139);border:1px solid #244665;border-radius:16px;padding:1.55rem 1.7rem;margin:.35rem 0 1.25rem}.demo-kicker{color:var(--accent);font-weight:800;font-size:.72rem;letter-spacing:.1em;text-transform:uppercase}.demo-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:1rem 1.15rem;min-height:132px}.demo-card b{font-size:.95rem;color:#fff}.demo-card p{font-size:.85rem;color:var(--muted)!important;line-height:1.6}.stSpinner>div{border-top-color:var(--accent)!important}
 </style>""",unsafe_allow_html=True)
-if "initialized" not in st.session_state: ensure_database(DEFAULT_DB);st.session_state.initialized=True
+if "initialized" not in st.session_state: ensure_database(DB_PATH);st.session_state.initialized=True
 
 def rows(sql,params=()):
-    c=connect(DEFAULT_DB);data=[dict(row) for row in c.execute(sql,params).fetchall()];c.close();return data
+    c=connect(DB_PATH);data=[dict(row) for row in c.execute(sql,params).fetchall()];c.close();return data
 def graph(state):
     labels=[event.action for event in state.action_history];unique=[]
     for item in labels:
@@ -33,27 +36,45 @@ def graph(state):
 def render_graph_safe(dot_source):
     try:st.graphviz_chart(dot_source,use_container_width=True)
     except Exception:st.info("Execution path (Graphviz rendering unavailable):");st.code(dot_source,language="dot")
-def run_case(request,case_id="",failures=()):
-    provider=build_provider();state=ResolutionAgent(Enterprise(str(DEFAULT_DB),FailureInjector(set(failures))),provider=provider).run(case_id or None,request);st.session_state.state=state
+def render_live_trace(state):
+    st.caption(f"Live trace · {state.llm_provider} · {len(state.tool_calls)} tool calls")
+    for event in state.action_history:
+        css="event-adapt" if event.status in {"ADAPTED","RETRY","FALLBACK"} else "event-fail" if event.status=="FAILED" else ""
+        st.markdown(f"<div class='event {css}'><b>{event.action.replace('_',' ')}</b> <span class='sub'>· {event.status}</span><br>{event.summary}<br><small>{event.tool} · {event.timestamp[:19]}</small></div>",unsafe_allow_html=True)
+
+def run_case(request,case_id="",failures=(),investigation_id=None):
+    provider=build_provider();agent=ResolutionAgent(Enterprise(str(DB_PATH),FailureInjector(set(failures))),provider=provider);placeholder=st.empty();state=None
+    for state in agent.run_streaming(case_id or None,request,investigation_id=investigation_id):
+        with placeholder.container():render_live_trace(state)
+    if state:st.session_state.state=state
 def workspace(state):
-    if state.case_id=="UNRESOLVED":st.warning(state.final_summary);return
+    if state.case_id=="UNRESOLVED":
+        st.warning(state.final_summary)
+        if state.final_status=="NEEDS_CLARIFICATION":
+            follow_up=st.text_input("Your answer",key=f"followup-{state.investigation_id}")
+            if st.button("Continue investigation") and follow_up:run_case(follow_up,investigation_id=state.investigation_id)
+        return
     case=rows("SELECT * FROM cases WHERE id=?",(state.case_id,))[0];order=rows("SELECT * FROM orders WHERE id=?",(state.order_id,))[0];customer=rows("SELECT * FROM customers WHERE id=?",(state.customer_id,))[0]
     st.markdown(f"<div class='casebar'><span class='chip'>{state.final_status}</span> &nbsp; <b>{state.case_id}</b> · {case['issue_type'].replace('_',' ')}<br><span class='sub'>Customer: {customer['name']} · Order: {state.order_id} · Product: {order['product_name']}</span></div>",unsafe_allow_html=True)
     left,center,right=st.columns([1.05,1.65,1])
     with left:
-        st.subheader("Case state");st.markdown(f"<div class='panel'><b>Customer objective</b><br>{state.user_request}<hr><b>Plan</b><br>{state.preferred_action.title()} → {(state.current_resolution or 'Human review').title()}<hr><b>Current status</b><br>{state.final_status}</div>",unsafe_allow_html=True)
+        last_reasoning=next((e.summary for e in reversed(state.action_history) if e.action=="LLM_DECISION"),state.user_request)
+        st.subheader("Case state");st.markdown(f"<div class='panel'><b>Customer objective</b><br>{state.user_request}<hr><b>Latest reasoning</b><br>{last_reasoning}<hr><b>Outcome</b><br>{(state.current_resolution or 'Investigating').replace('_',' ').title()}<hr><b>Current status</b><br>{state.final_status}</div>",unsafe_allow_html=True)
         if state.replans: st.warning("Adaptation recorded: replacement strategy changed after a real enterprise constraint.")
     with center:
         st.subheader("Execution timeline")
-        for event in state.action_history:
-            css="event-adapt" if event.status in {"ADAPTED","RETRY"} else "event-fail" if event.status=="FAILED" else ""
-            st.markdown(f"<div class='event {css}'><b>{event.action.replace('_',' ')}</b> <span class='sub'>· {event.status}</span><br>{event.summary}<br><small>{event.tool} · {event.timestamp[:19]}</small></div>",unsafe_allow_html=True)
+        render_live_trace(state)
     with right:
         st.subheader("Agent status");st.caption(f"Intent provider: {state.llm_provider}");metrics=[("Current outcome",(state.current_resolution or "Clarification").title()),("Actions",str(len(state.action_history))),("Tool calls",str(len(state.tool_calls))),("Adaptations",str(state.replans)),("Verifications",str(len(state.verification_results)))]
         for key,value in metrics:st.metric(key,value)
     tabs=st.tabs(["Customer view","Operations","State diff & verification","Agent graph","Audit"])
     with tabs[0]:st.success(state.final_summary or "Investigation complete.");st.download_button("Download resolution report",resolution_report(state),f"resolveai-{state.case_id}.md","text/markdown")
-    with tabs[1]:st.json({"goal":state.goal.model_dump() if state.goal else {},"tool_calls":state.tool_calls,"failures":state.failures})
+    with tabs[1]:
+        st.subheader("Retrieved policy evidence")
+        if state.policy_citations:
+            for citation in state.policy_citations:st.markdown(f"**{citation['title']}** · similarity {citation['score']}<br>{citation['text']}",unsafe_allow_html=True)
+        else:st.info("No policy snippets were retrieved for this case.")
+        st.divider();st.json({"tool_calls":state.tool_calls,"failures":state.failures,"provider_fallback_reason":state.provider_fallback_reason})
     with tabs[2]:
         if state.current_resolution=="refund":
             payment=rows("SELECT * FROM payments WHERE order_id=?",(state.order_id,))[0];st.markdown(f"<div class='panel'><b>Payment state</b><br>PAYMENT_CAPTURED &nbsp; → &nbsp; <b>{payment['status']}</b><br><br><b>Refunded amount</b><br>₹0.00 &nbsp; → &nbsp; <b>₹{payment['refunded_amount']:.2f}</b><br><br><b>Case state</b><br>OPEN &nbsp; → &nbsp; <b>{case['status']}</b></div>",unsafe_allow_html=True)
@@ -61,9 +82,13 @@ def workspace(state):
         else:st.info("No final verification was completed.")
     with tabs[3]:render_graph_safe(graph(state))
     with tabs[4]:st.dataframe(rows("SELECT created_at,action,tool,before_state,after_state,reason FROM audit_events WHERE case_id=? ORDER BY id",(state.case_id,)),use_container_width=True,hide_index=True)
+    if state.final_status=="NEEDS_CLARIFICATION":
+        follow_up=st.text_input("Your answer",key=f"followup-{state.investigation_id}")
+        if st.button("Continue investigation") and follow_up:run_case(follow_up,investigation_id=state.investigation_id)
 
 with st.sidebar:
-    st.markdown("<div class='brand'>✦ ResolveAI</div><div class='sub'>AUTONOMOUS RESOLUTION OPS</div>",unsafe_allow_html=True);page=st.radio("Navigation",["New case","Cases","Agent graph","Enterprise data","Demo & simulation"],label_visibility="collapsed");st.divider();st.caption("Active customer context: Alex Morgan (CUS-100)");st.success("SQLite online · Policy active");st.info(f"LLM route: {build_provider().name}")
+    st.markdown("<div class='brand'>✦ ResolveAI</div><div class='sub'>AUTONOMOUS RESOLUTION OPS</div>",unsafe_allow_html=True);page=st.radio("Navigation",["New case","Cases","Agent graph","Enterprise data","Demo & simulation"],label_visibility="collapsed");st.divider();st.caption("Active customer context: Alex Morgan (CUS-100)");st.success("SQLite online · Policy active");active_state=st.session_state.get("state");st.info(f"LLM route: {active_state.llm_provider if active_state else 'Not yet run'}")
+    if active_state and active_state.provider_fallback_reason:st.warning(f"Fell back from the primary model: {active_state.provider_fallback_reason}")
 if page=="New case":
     st.title("What can ResolveAI resolve for you?");st.caption("Describe the issue naturally. ResolveAI uses the active customer context, or an order/case ID you mention, to locate enterprise records.")
     request=st.text_area("Customer issue",placeholder="My headphones arrived damaged and I want a replacement.",height=130)
@@ -95,6 +120,6 @@ else:
     with right:failures=st.multiselect("Inject one-time service failures",["refund_api_temporarily_unavailable","replacement_api_temporarily_unavailable","verification_failure"],placeholder="No fault injection")
     action1,action2,_=st.columns([1,1,2])
     with action1:
-        if st.button("Reset enterprise state",use_container_width=True):reset_database(DEFAULT_DB,scenario);st.session_state.pop("state",None);st.success("Enterprise state reset.")
+        if st.button("Reset enterprise state",use_container_width=True):reset_database(DB_PATH,scenario);st.session_state.pop("state",None);st.success("Enterprise state reset.")
     with action2:
         if st.button("Run flagship case",type="primary",use_container_width=True):run_case("My headphones arrived damaged and I want a replacement.","CASE-100",failures);workspace(st.session_state.state)

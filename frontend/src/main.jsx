@@ -1,0 +1,20 @@
+import React, {useState} from 'react';
+import {createRoot} from 'react-dom/client';
+import './styles.css';
+
+const API=import.meta.env.VITE_RESOLVEAI_API_URL || 'http://localhost:8000';
+const samples=[
+  ['Adaptive resolution','CASE-100','My headphones arrived damaged and I want a replacement.'],
+  ['Combined request','CASE-200','My speaker arrived damaged and I was charged twice.'],
+  ['Post-shipment return','CASE-500','Please cancel my order.'],
+  ['High-value approval','CASE-800','Refund my laptop; I did not authorize this purchase.']
+];
+function Trace({state}) { return <section className="panel trace"><h2>Live agent trace</h2>{state?.action_history?.map((event,i)=><article className={`event ${event.status.toLowerCase()}`} key={i}><b>{event.action.replaceAll('_',' ')}</b><span>{event.status}</span><p>{event.summary}</p><small>{event.tool}</small></article>) || <p className="muted">Submit a request to watch every decision and tool result.</p>}</section> }
+function Evidence({state}) { return <section className="panel"><h2>Policy evidence</h2>{state?.policy_citations?.length ? state.policy_citations.map(c=><article className="citation" key={c.id}><b>{c.title}</b><span>similarity {c.score}</span><p>{c.text}</p></article>) : <p className="muted">Policy retrieval appears here as soon as the agent calls SEARCH POLICY.</p>}</section> }
+function CaseState({state}) { const calls=state?.tool_calls||[]; const reads=Object.fromEntries(calls.filter(c=>c.success && ['GET_ORDER','GET_PAYMENT','GET_INVENTORY'].includes(c.tool)).map(c=>[c.tool,c.data])); return <section className="panel"><h2>Authoritative state</h2><dl><dt>Case</dt><dd>{state?.case_id||'—'}</dd><dt>Provider</dt><dd>{state?.llm_provider||'—'}</dd><dt>Outcome</dt><dd>{state?.final_status||'Waiting'}</dd><dt>Resolution</dt><dd>{state?.current_resolution?.replaceAll('_',' ')||'—'}</dd></dl>{state?.provider_fallback_reason&&<p className="warning">Fallback: {state.provider_fallback_reason}</p>}<pre>{JSON.stringify(reads,null,2)}</pre></section> }
+function App(){
+  const [caseId,setCaseId]=useState('CASE-100'),[request,setRequest]=useState(samples[0][2]),[state,setState]=useState(null),[busy,setBusy]=useState(false),[error,setError]=useState('');
+  async function resolve(){setBusy(true);setError('');setState(null);try {const res=await fetch(`${API}/cases/${caseId}/resolve/stream`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({request})});if(!res.ok)throw new Error(`API ${res.status}`);const reader=res.body.getReader(),decoder=new TextDecoder();let buffer='';while(true){const {value,done}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});const parts=buffer.split('\n\n');buffer=parts.pop();for(const part of parts){const line=part.split('\n').find(x=>x.startsWith('data: '));if(line)setState(JSON.parse(line.slice(6)).state)}}}catch(e){setError(e.message)}finally{setBusy(false)}}
+  return <main><header><div><span className="eyebrow">RESOLVEAI / LIVE DEMO</span><h1>Autonomous resolution, visibly grounded.</h1></div><div className={`provider ${state?.llm_provider==='offline-demo'?'fallback':''}`}>{state?.llm_provider||'Not yet run'}</div></header><section className="composer panel"><label>Case ID<input value={caseId} onChange={e=>setCaseId(e.target.value.toUpperCase())}/></label><label>Customer request<textarea value={request} onChange={e=>setRequest(e.target.value)}/></label><div className="samples">{samples.map(([name,id,text])=><button key={name} onClick={()=>{setCaseId(id);setRequest(text)}}>{name}</button>)}</div><button className="resolve" disabled={busy||!caseId||!request} onClick={resolve}>{busy?'Resolving…':'Start live resolution'}</button>{error&&<p className="warning">{error}. Start the FastAPI service at {API}.</p>}</section><div className="grid"><Trace state={state}/><aside><Evidence state={state}/><CaseState state={state}/></aside></div>{state?.final_status==='NEEDS_CLARIFICATION'&&<p className="clarify">The case needs clarification: {state.final_summary}</p>}</main>
+}
+createRoot(document.getElementById('root')).render(<App/>);

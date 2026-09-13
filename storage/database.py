@@ -9,18 +9,19 @@ PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS customers(id TEXT PRIMARY KEY,name TEXT NOT NULL,email TEXT NOT NULL UNIQUE,tier TEXT NOT NULL,status TEXT NOT NULL,address TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS products(id TEXT PRIMARY KEY,sku TEXT UNIQUE,name TEXT NOT NULL,category TEXT,price REAL NOT NULL,return_window_days INTEGER NOT NULL DEFAULT 30);
 CREATE TABLE IF NOT EXISTS warehouses(id TEXT PRIMARY KEY,name TEXT,location TEXT,is_operational INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,customer_id TEXT NOT NULL REFERENCES customers(id),product_id TEXT,product_name TEXT,status TEXT NOT NULL,created_at TEXT,delivered_at TEXT,payment_status TEXT,amount REAL NOT NULL,eligible_refund INTEGER,eligible_replacement INTEGER,cancellation_allowed INTEGER);
+CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,customer_id TEXT NOT NULL REFERENCES customers(id),product_id TEXT,product_name TEXT,status TEXT NOT NULL,created_at TEXT,delivered_at TEXT,payment_status TEXT,amount REAL NOT NULL,eligible_refund INTEGER,eligible_replacement INTEGER,cancellation_allowed INTEGER); -- deprecated: services/policy_rules.py computes eligibility
 CREATE TABLE IF NOT EXISTS order_items(id TEXT PRIMARY KEY,order_id TEXT REFERENCES orders(id),product_id TEXT REFERENCES products(id),quantity INTEGER,unit_price REAL,delivered_sku TEXT);
 CREATE TABLE IF NOT EXISTS inventory(product_id TEXT NOT NULL REFERENCES products(id),warehouse_id TEXT NOT NULL REFERENCES warehouses(id),available_units INTEGER NOT NULL,reserved_units INTEGER NOT NULL DEFAULT 0,incoming_units INTEGER NOT NULL DEFAULT 0,reorder_level INTEGER NOT NULL DEFAULT 2,status TEXT,PRIMARY KEY(product_id,warehouse_id));
 CREATE TABLE IF NOT EXISTS cases(id TEXT PRIMARY KEY,customer_id TEXT REFERENCES customers(id),order_id TEXT REFERENCES orders(id),issue_type TEXT,description TEXT,status TEXT,current_resolution TEXT,priority TEXT,resolution_summary TEXT);
 CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY,order_id TEXT REFERENCES orders(id),amount REAL,currency TEXT,method TEXT,status TEXT,refunded_amount REAL DEFAULT 0,transaction_reference TEXT,authorization_token TEXT);
-CREATE TABLE IF NOT EXISTS refunds(id TEXT PRIMARY KEY,order_id TEXT UNIQUE REFERENCES orders(id),case_id TEXT REFERENCES cases(id),amount REAL,status TEXT,reason TEXT,payment_id TEXT,idempotency_key TEXT UNIQUE,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS refunds(id TEXT PRIMARY KEY,order_id TEXT REFERENCES orders(id),case_id TEXT REFERENCES cases(id),amount REAL,status TEXT,reason TEXT,payment_id TEXT,idempotency_key TEXT UNIQUE,item_id TEXT,quantity INTEGER,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS replacements(id TEXT PRIMARY KEY,order_id TEXT UNIQUE REFERENCES orders(id),case_id TEXT,product_id TEXT,warehouse_id TEXT,status TEXT,tracking_number TEXT);
 CREATE TABLE IF NOT EXISTS shipments(id TEXT PRIMARY KEY,order_id TEXT REFERENCES orders(id),carrier TEXT,status TEXT,tracking_number TEXT,estimated_delivery TEXT);
 CREATE TABLE IF NOT EXISTS carrier_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,order_id TEXT,tracking_number TEXT,status TEXT,last_update TEXT,note TEXT);
 CREATE TABLE IF NOT EXISTS return_labels(id TEXT PRIMARY KEY,order_id TEXT UNIQUE,sku TEXT,label_url TEXT,status TEXT);
 CREATE TABLE IF NOT EXISTS approval_tasks(id TEXT PRIMARY KEY,case_id TEXT,reason TEXT,status TEXT,audit_package TEXT);
 CREATE TABLE IF NOT EXISTS audit_events(id INTEGER PRIMARY KEY AUTOINCREMENT,case_id TEXT,action TEXT,tool TEXT,before_state TEXT,after_state TEXT,reason TEXT,verification_status TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS investigation_requests(id TEXT PRIMARY KEY,case_id TEXT,question TEXT,status TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);CREATE INDEX IF NOT EXISTS idx_orders_product ON orders(product_name);CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status);CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(order_id);CREATE INDEX IF NOT EXISTS idx_shipments_order ON shipments(order_id);
 """
 def connect(path: str|Path=DEFAULT_DB)->sqlite3.Connection:
@@ -33,7 +34,12 @@ def ensure_database(path: str|Path=DEFAULT_DB)->None:
     c.close()
     # Earlier prototype schemas are simulation-only and cannot safely satisfy V3 foreign-key contracts.
     if not has_v3:reset_database(path);return
-    c=connect(path);c.executescript(SCHEMA);c.commit();c.close()
+    c=connect(path);c.executescript(SCHEMA)
+    # Lightweight forward-compatible upgrades for a local prototype database.
+    columns={row[1] for row in c.execute("PRAGMA table_info(refunds)")}
+    if "item_id" not in columns: c.execute("ALTER TABLE refunds ADD COLUMN item_id TEXT")
+    if "quantity" not in columns: c.execute("ALTER TABLE refunds ADD COLUMN quantity INTEGER")
+    c.commit();c.close()
 def reset_database(path: str|Path=DEFAULT_DB,scenario: str="adaptation")->None:
     path=Path(path)
     if path.exists():path.unlink()

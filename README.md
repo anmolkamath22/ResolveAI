@@ -26,16 +26,20 @@ The next step comes from the state returned by the services. A model cannot dire
 ## Architecture
 
 ```text
-Customer request
-  → intent parsing
-  → case and entity resolution
-  → deterministic policy and service checks
-  → authorized state mutation
-  → independent verification
+Customer request → policy retrieval + authorized state → LLM tool decision
+  → deterministic service gate → observation/replan → independent verification
   → customer-safe result and audit trail
 ```
 
-The application uses SQLite as the simulated system of record. The tool registry is allow-listed, and financial and fulfilment actions are implemented in deterministic Python services. Gemini can classify a request when configured; OpenRouter is an optional fallback. The offline parser keeps the local demo usable without an API key.
+The application uses SQLite as the simulated system of record. Policy RAG informs the decision; deterministic services gate every financial and fulfilment mutation. The tool registry is allow-listed and idempotent. Gemini/OpenRouter can be configured, while the offline provider keeps local tests reproducible.
+
+Eligibility is computed from authoritative order state in `services/policy_rules.py` (payment state, delivery date, shipment status, and the delegated high-value threshold), not from seeded eligibility flags. `services/bitext_intent_cache.json` is a committed, capped cache generated from Bitext's customer-support dataset; its TF-IDF intent hint improves natural-language entity resolution while explicit case/order IDs remain authoritative.
+
+## API and containers
+
+The HTTP service exposes `POST /cases/{id}/resolve`, streamed `POST /cases/{id}/resolve/stream`, `POST /cases/resolve`, `GET /cases/{id}`, and database-aware `GET /healthz`. Run it with `uvicorn app.api:app --reload`, or launch the API, Streamlit console, and React live-trace demo together with `docker compose --env-file .env up --build`. Set `RESOLVEAI_API_KEY` in deployment to protect write endpoints. The React demo is at `http://localhost:5173`.
+
+The UI displays the actual provider for each investigation. `offline-demo` means the deterministic CI/test stub ran due to a missing or failed live provider; it is not presented as live AI reasoning. For container runs, keep credentials only in `.env` or your secret manager and pass them with `--env-file .env`.
 
 ## Run locally
 
@@ -101,4 +105,4 @@ tests/      Automated regression tests
 
 ## Scope
 
-ResolveAI is a hackathon prototype. Its customer, payment, carrier, and inventory data are synthetic. It is not connected to real payment processors or commerce platforms. A production version would need authentication, role controls, managed storage, monitoring, and real integration contracts.
+ResolveAI is a hackathon prototype. Its customer, payment, carrier, and inventory data are synthetic. It is not connected to real payment processors or commerce platforms. Case authorization is scoped to a shared API key plus explicit customer-context matching; production would require per-customer authenticated sessions.

@@ -2,15 +2,16 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 class Action(str, Enum):
-    GET_CUSTOMER="GET_CUSTOMER"; GET_ORDER="GET_ORDER"; CHECK_POLICY="CHECK_POLICY"
-    GET_INVENTORY="GET_INVENTORY"; CREATE_REPLACEMENT="CREATE_REPLACEMENT"
-    CREATE_REFUND="CREATE_REFUND"; CANCEL_ORDER="CANCEL_ORDER"; ESCALATE="ESCALATE"; VERIFY="VERIFY"
-    GET_PAYMENT="GET_PAYMENT"; GET_SHIPMENT="GET_SHIPMENT"; GENERATE_RETURN_LABEL="GENERATE_RETURN_LABEL"
-    REVERSE_DUPLICATE_CHARGE="REVERSE_DUPLICATE_CHARGE"; ESCALATE_HIGH_VALUE="ESCALATE_HIGH_VALUE"
+    GET_CUSTOMER="GET_CUSTOMER"; GET_ORDER="GET_ORDER"; GET_PAYMENT="GET_PAYMENT"; GET_SHIPMENT="GET_SHIPMENT"
+    GET_INVENTORY="GET_INVENTORY"; SEARCH_CUSTOMER="SEARCH_CUSTOMER"; GET_CASE_HISTORY="GET_CASE_HISTORY"; SEARCH_POLICY="SEARCH_POLICY"
+    CREATE_REFUND="CREATE_REFUND"; CREATE_REPLACEMENT="CREATE_REPLACEMENT"; CANCEL_ORDER="CANCEL_ORDER"
+    REVERSE_DUPLICATE_CHARGE="REVERSE_DUPLICATE_CHARGE"; GENERATE_RETURN_LABEL="GENERATE_RETURN_LABEL"
+    CREATE_APPROVAL_TASK="CREATE_APPROVAL_TASK"; ESCALATE="ESCALATE"; REQUEST_CUSTOMER_INFO="REQUEST_CUSTOMER_INFO"; VERIFY="VERIFY"
+    RESOLVE_CASE="RESOLVE_CASE"; CHECK_POLICY="CHECK_POLICY"  # read-only compatibility
 
 class ToolCall(BaseModel):
     """Validated audit-safe tool contract; the registry accepts no arbitrary executable action."""
@@ -24,9 +25,29 @@ class ToolResult(BaseModel):
     message: str = ""
 
 class Goal(BaseModel):
-    issue_type: str
-    requested_resolution: str
+    """Legacy intent-provider contract; not used to route the agent."""
+    issue_type: str = "unclassified"
+    requested_resolution: str = "investigate"
     urgency: str = "NORMAL"
+
+class AgentAction(BaseModel):
+    tool: str
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    reason: str
+
+class TerminalDecision(BaseModel):
+    status: Literal["RESOLVED", "ESCALATED", "NEEDS_CLARIFICATION", "ACTION_REQUIRED"]
+    reason: str
+    summary: str
+
+class AgentDecision(BaseModel):
+    """Provider output is one tool request or one terminal decision, never both."""
+    reasoning: str
+    action: AgentAction | None = None
+    terminal: TerminalDecision | None = None
+    def model_post_init(self, __context: Any) -> None:
+        if bool(self.action) == bool(self.terminal):
+            raise ValueError("AgentDecision requires exactly one of action or terminal")
 
 class ActionRecord(BaseModel):
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -36,7 +57,6 @@ class ActionRecord(BaseModel):
 class ResolutionState(BaseModel):
     investigation_id: str; case_id: str; user_request: str
     customer_id: str | None = None; order_id: str | None = None; product_id: str | None = None
-    goal: Goal | None = None; preferred_action: str | None = None
     current_resolution: str | None = None; final_status: str = "IN_PROGRESS"
     action_history: list[ActionRecord] = Field(default_factory=list)
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
@@ -45,6 +65,9 @@ class ResolutionState(BaseModel):
     replans: int = 0; verification_results: list[dict[str, Any]] = Field(default_factory=list)
     final_summary: str | None = None
     llm_provider: str = "offline-demo"
+    provider_fallback_reason: str | None = None
+    policy_citations: list[dict[str, Any]] = Field(default_factory=list)
+    pending_action: str | None = None
 
     def event(self, action: str, tool: str, status: str, summary: str, **kwargs: str) -> None:
         self.action_history.append(ActionRecord(action=action, tool=tool, status=status, summary=summary, **kwargs))

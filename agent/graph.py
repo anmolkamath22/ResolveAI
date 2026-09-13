@@ -1,122 +1,81 @@
-"""Bounded, deterministic state-machine agent. Decisions are based on observed tool results."""
+"""Bounded, observable observe → decide → execute agent loop."""
 from __future__ import annotations
+from collections.abc import Iterator
 from uuid import uuid4
-from models.schemas import ResolutionState, Goal
+from models.schemas import ResolutionState, ToolResult
 from services.enterprise import Enterprise
 from providers.llm.factory import build_provider
 from tools.registry import ToolRegistry
+from storage.database import connect
 
-MAX_AGENT_ACTIONS=8; MAX_REPLANS=2; MAX_RETRIES=2
-
-def parse_goal(request: str) -> Goal:
-    text=request.lower(); requested="replacement" if any(x in text for x in ("replace","replacement","new one")) else "cancellation" if "cancel" in text else "refund"
-    issue="DAMAGED_ITEM" if any(x in text for x in ("damage","broken","defect")) else "GENERAL_REQUEST"
-    return Goal(issue_type=issue,requested_resolution=requested)
+MAX_TURNS=16; MAX_MUTATING_ACTIONS=6
+MUTATING={"CREATE_REFUND","CREATE_REPLACEMENT","CANCEL_ORDER","REVERSE_DUPLICATE_CHARGE","GENERATE_RETURN_LABEL","CREATE_APPROVAL_TASK","ESCALATE","REQUEST_CUSTOMER_INFO"}
+VERIFY_ACTION={"CREATE_REFUND":"refund","CREATE_REPLACEMENT":"replacement","CANCEL_ORDER":"cancellation","REVERSE_DUPLICATE_CHARGE":"duplicate_reversal","GENERATE_RETURN_LABEL":"return_label","CREATE_APPROVAL_TASK":"approval"}
 
 class ResolutionAgent:
-    def __init__(self, enterprise: Enterprise, provider=None):
-        self.enterprise=enterprise; self.provider=provider or build_provider(); self.tools=ToolRegistry(enterprise)
-    def _call(self, state: ResolutionState, tool_name: str, event_action: str, tool: str, **inputs):
-        """Retry transient errors only; logical policy/inventory failures trigger adaptation."""
-        for attempt in range(MAX_RETRIES + 1):
-            result=self.tools.execute(tool_name, **inputs)
-            state.tool_calls.append({"tool":tool_name,"inputs":inputs,"success":result.success,"error_type":result.error_type,"attempt":attempt + 1})
-            if result.success or result.error_type not in {"SERVICE_UNAVAILABLE", "TIMEOUT"}: return result
-            state.event(event_action,tool,"RETRY",f"{result.message} Retrying safely ({attempt + 1}/{MAX_RETRIES}).")
+    def __init__(self,enterprise: Enterprise,provider=None): self.enterprise=enterprise;self.provider=provider or build_provider();self.tools=ToolRegistry(enterprise)
+    def _observe(self,state,tool,inputs,result: ToolResult):
+        state.tool_calls.append({"tool":tool,"inputs":inputs,"success":result.success,"error_type":result.error_type,"message":result.message,"data":result.data});state.observations.append(f"{tool}: {result.message}");state.event(tool,"ToolRegistry","SUCCESS" if result.success else "FAILED",result.message)
+        if tool=="SEARCH_POLICY" and result.success:state.policy_citations.extend(result.data.get("snippets",[]))
+        if not result.success:state.failures.append(result.message)
+    def _execute(self,state,tool,inputs):
+        result=self.tools.execute(tool,**inputs);self._observe(state,tool,inputs,result)
+        if not result.success and result.error_type in {"SERVICE_UNAVAILABLE","TIMEOUT"}:
+            state.event(tool,"RetryGuard","RETRY","Transient failure; one safe retry is allowed.");result=self.tools.execute(tool,**inputs);self._observe(state,tool,inputs,result)
         return result
-    def run(self, case_id: str | None, request: str, max_actions: int=MAX_AGENT_ACTIONS) -> ResolutionState:
-        # Case lookup is intentionally authoritative, never inferred from request text.
-        from storage.database import connect
-        case_id=(case_id or "").strip().upper()
-        if not case_id:
-            resolved=self._call(ResolutionState(investigation_id="TEMP",case_id="UNRESOLVED",user_request=request),"RESOLVE_CASE","RESOLVE_CASE","EntityResolver",request=request)
-            if not resolved.success:
-                state=ResolutionState(investigation_id="INV-"+uuid4().hex[:8].upper(),case_id="UNRESOLVED",user_request=request);state.final_status="NEEDS_CLARIFICATION";state.final_summary=resolved.message;state.event("RESOLVE_ENTITIES","EntityResolver","FAILED",resolved.message);return state
-            case_id=resolved.data["case"]["id"]
-        c=connect(self.enterprise.db_path); case=c.execute("SELECT * FROM cases WHERE id=?",(case_id,)).fetchone();c.close()
-        state=ResolutionState(investigation_id="INV-"+uuid4().hex[:8].upper(),case_id=case_id,user_request=request)
-        if not case:
-            state.final_status="ESCALATED";state.final_summary="The requested case could not be found.";return state
-        state.customer_id=case["customer_id"];state.order_id=case["order_id"];state.goal=self.provider.parse_goal(request);state.llm_provider=self.provider.name;state.preferred_action=state.goal.requested_resolution
-        state.event("PARSE_GOAL","GoalParser","SUCCESS",f"Goal understood by {state.llm_provider}: {state.goal.requested_resolution} for {state.goal.issue_type}.")
-        if getattr(self.provider,"last_error",None): state.event("LLM_FALLBACK","ProviderRouter","RETRY",f"Live provider unavailable; safely continued with offline intent parsing ({self.provider.last_error}).")
-        state.event("RESOLVE_ENTITIES","EntityResolver","SUCCESS",f"Resolved case {case_id} from request context.")
-        customer=self._call(state,"GET_CUSTOMER","GET_CUSTOMER","CustomerService",customer_id=state.customer_id); state.event("GET_CUSTOMER","CustomerService","SUCCESS" if customer.success else "FAILED",customer.message)
-        order=self._call(state,"GET_ORDER","GET_ORDER","OrderService",order_id=state.order_id)
-        if not order.success: return self._escalate(state,"Order could not be retrieved.")
-        state.product_id=order.data["product_id"];state.event("GET_ORDER","OrderService","SUCCESS","Order %s located."%state.order_id)
-        # V3 operational archetypes route from stored case truth, not demo IDs or a model's claim.
-        if case["issue_type"] != "DAMAGED_ITEM" and not (case["issue_type"]=="DUPLICATE_CHARGE" and state.goal.requested_resolution=="replacement"):
-            return self._run_operational_archetype(state, dict(case), order.data)
-        # Explicit state transitions with bounded turns: candidate is customer-preferred, then evidence-driven fallback.
-        candidates=[state.preferred_action]+[x for x in ("replacement","refund","cancellation") if x!=state.preferred_action]
-        for candidate in candidates:
-            # Bound external enterprise operations, not audit/event granularity.
-            if len(state.tool_calls)>=max_actions: return self._escalate(state,"Action safety limit reached.")
-            if candidate not in ("replacement","refund","cancellation"): continue
-            policy=self._call(state,"CHECK_POLICY","CHECK_POLICY","PolicyService",order_id=state.order_id,action=candidate);state.event("CHECK_POLICY","PolicyService","SUCCESS" if policy.success else "FAILED",policy.message)
-            if not policy.data.get("allowed"):
-                state.failures.append(policy.message);continue
-            if candidate=="replacement":
-                inv=self._call(state,"GET_INVENTORY","GET_INVENTORY","InventoryService",product_id=state.product_id);state.event("GET_INVENTORY","InventoryService","SUCCESS" if inv.success else "FAILED",inv.message)
-                if not inv.success or inv.data["available_units"]<1:
-                    state.failures.append("Replacement blocked by inventory constraint.");state.replans+=1;state.event("ADAPT_PLAN","AdaptationEngine","ADAPTED","Replacement cannot be fulfilled; evaluating a permitted refund.");continue
-                result=self._call(state,"CREATE_REPLACEMENT","CREATE_REPLACEMENT","ReplacementService",case_id=case_id,order_id=state.order_id,product_id=state.product_id,reason="Damaged item")
-            elif candidate=="refund":
-                payment=self._call(state,"GET_PAYMENT","GET_PAYMENT","PaymentService",order_id=state.order_id);state.event("GET_PAYMENT","PaymentService","SUCCESS" if payment.success else "FAILED",payment.message)
-                if not payment.success: state.failures.append(payment.message);continue
-                result=self._call(state,"CREATE_REFUND","CREATE_REFUND","RefundService",case_id=case_id,order_id=state.order_id,reason="Damaged item / requested resolution unavailable")
-            else: result=self._call(state,"CANCEL_ORDER","CANCEL_ORDER","CancellationService",case_id=case_id,order_id=state.order_id,reason="Customer cancellation request")
-            state.event("CREATE_"+candidate.upper(),candidate.title()+"Service","SUCCESS" if result.success else "FAILED",result.message)
+    def _facts(self,state,case):
+        values={"case_id":state.case_id,"customer_id":state.customer_id,"order_id":state.order_id,"case":case}
+        for call in state.tool_calls:
+            if call["success"]:
+                key={"GET_ORDER":"order","GET_INVENTORY":"inventory","GET_CUSTOMER":"customer","GET_PAYMENT":"payment","GET_SHIPMENT":"shipment"}.get(call["tool"])
+                if key:values[key]=call["data"]
+        return values
+    def _context(self,state,case):
+        facts=self._facts(state,case)
+        gates={action:self.enterprise.policy(state.order_id,action).data for action in ("refund","replacement","cancellation")} if state.order_id else {}
+        return {"request":state.user_request,"snapshot":facts,"case":case,"order":facts.get("order",{}),"inventory":facts.get("inventory",{}),"tool_calls":state.tool_calls,"pending_action":state.pending_action,"policy_citations":state.policy_citations,"policy_gates":gates,"predicted_intent":self.enterprise.intent_classifier.classify(state.user_request,top_k=1),"available_tools":self.tools.schemas(),"error_handling":"Non-transient errors require a different action or escalation; tools are policy-gated."}
+    def _terminal(self,state,status,summary,reason): state.final_status=status;state.final_summary=summary;state.event("TERMINAL","ResolutionAgent",status,reason);return state
+    def _clarification(self,state,message):
+        result=self._execute(state,"REQUEST_CUSTOMER_INFO",{"case_id":None if state.case_id=="UNRESOLVED" else state.case_id,"question":message,"investigation_id":state.investigation_id})
+        if result.success:state.investigation_id=result.data["investigation_id"]
+        return self._terminal(state,"NEEDS_CLARIFICATION",message,"Entity resolution requires a unique, authorized match.")
+    def run(self,*args,**kwargs)->ResolutionState:
+        final=None
+        for final in self.run_streaming(*args,**kwargs): pass
+        assert final is not None
+        return final
+    def run_streaming(self,case_id: str|None,request: str,max_actions: int=MAX_MUTATING_ACTIONS,customer_context: str|None="CUS-100",investigation_id: str|None=None)->Iterator[ResolutionState]:
+        investigation_id=investigation_id or "INV-"+uuid4().hex[:8].upper();resolved_id=(case_id or "").strip().upper()
+        if not resolved_id:
+            temp=ResolutionState(investigation_id=investigation_id,case_id="UNRESOLVED",user_request=request);entity=self._execute(temp,"RESOLVE_CASE",{"request":request,"customer_context":customer_context})
+            if not entity.success:yield self._clarification(temp,entity.message);return
+            resolved_id=entity.data["case"]["id"]
+        c=connect(self.enterprise.db_path);row=c.execute("SELECT * FROM cases WHERE id=?",(resolved_id,)).fetchone();c.close()
+        if not row:yield self._clarification(ResolutionState(investigation_id=investigation_id,case_id=resolved_id or "UNRESOLVED",user_request=request),"That case could not be found. Please provide a valid order ID or case ID.");return
+        case=dict(row);state=ResolutionState(investigation_id=investigation_id,case_id=resolved_id,user_request=request,customer_id=case["customer_id"],order_id=case["order_id"],llm_provider=self.provider.name);state.event("RESOLVE_ENTITIES","EntityResolver","SUCCESS",f"Resolved authorized case {resolved_id}.");yield state
+        failures={}
+        for _turn in range(MAX_TURNS):
+            decision=self.provider.decide(self._context(state,case));state.llm_provider=self.provider.name
+            if state.llm_provider=="offline-demo":
+                state.provider_fallback_reason=getattr(self.provider,"last_error",None) or "No live provider configured"
+                if not any(event.action=="PROVIDER_FALLBACK" for event in state.action_history):state.event("PROVIDER_FALLBACK","ProviderRouter","FALLBACK",state.provider_fallback_reason)
+            state.event("LLM_DECISION",state.llm_provider,"SUCCESS",decision.reasoning)
+            if decision.terminal:yield self._terminal(state,decision.terminal.status,decision.terminal.summary,decision.terminal.reason);return
+            action=decision.action
+            if not action:yield state;continue
+            if action.tool not in self.tools.names:self._observe(state,action.tool,action.inputs,ToolResult(success=False,error_type="INVALID_TOOL",message="Requested tool is not available"));yield state;continue
+            if action.tool in MUTATING and sum(c["tool"] in MUTATING and c["success"] for c in state.tool_calls)>=max_actions:yield self._terminal(state,"ESCALATED","A specialist will review this case.","Mutation safety limit reached.");return
+            result=self._execute(state,action.tool,action.inputs)
             if not result.success:
-                state.failures.append(result.message);continue
-            verification=self._call(state,"VERIFY","VERIFY","VerificationService",case_id=case_id,order_id=state.order_id,action=candidate);state.verification_results.append(verification.data);state.event("VERIFY", "VerificationService", "SUCCESS" if verification.success else "FAILED",verification.message)
-            if verification.success:
-                state.current_resolution=candidate;state.final_status="RESOLVED";state.final_summary=self._summary(state,result.data);return state
-            state.failures.append(verification.message);state.replans+=1
-        return self._escalate(state,"No safe, permitted resolution remains after policy and state checks.")
-    def _run_operational_archetype(self,state: ResolutionState,case: dict,order: dict) -> ResolutionState:
-        issue=case["issue_type"]
-        state.event("ANALYZE_CASE","CaseAnalyzer","SUCCESS",f"Operational archetype identified: {issue}.")
-        if issue=="DUPLICATE_CHARGE":
-            result=self._call(state,"REVERSE_DUPLICATE_CHARGE","PaymentLedger","PaymentService",case_id=state.case_id,order_id=state.order_id)
-            state.event("REVERSE_DUPLICATE_CHARGE","PaymentService","SUCCESS" if result.success else "FAILED",result.message)
-            if result.success:return self._finalize(state,"duplicate_reversal",result.message)
-        elif issue=="PRE_SHIPMENT_CANCELLATION":
-            result=self._call(state,"CANCEL_ORDER","CancellationService","CancellationService",case_id=state.case_id,order_id=state.order_id,reason="Customer cancellation before shipment")
-            state.event("CANCEL_ORDER","CancellationService","SUCCESS" if result.success else "FAILED",result.message)
-            if result.success:return self._finalize(state,"cancellation",result.message)
-        elif issue=="POST_SHIPMENT_CANCELLATION":
-            state.event("CHECK_POLICY","PolicyService","BLOCKED","Cancellation is blocked because the parcel is already in transit.")
-            result=self._call(state,"GENERATE_RETURN_LABEL","ReturnService","ReturnService",case_id=state.case_id,order_id=state.order_id,sku=order["product_id"])
-            state.event("GENERATE_RETURN_LABEL","ReturnService","SUCCESS" if result.success else "FAILED",result.message)
-            if result.success:
-                state.current_resolution="return_pending";state.final_status="ACTION_REQUIRED";state.final_summary="The shipment is already in transit, so cancellation was not permitted. A prepaid return label has been created for delivery refusal or return.";return state
-        elif issue=="WRONG_ITEM":
-            result=self._call(state,"GENERATE_RETURN_LABEL","ReturnService","ReturnService",case_id=state.case_id,order_id=state.order_id,sku="SP-200")
-            state.event("GENERATE_RETURN_LABEL","ReturnService","SUCCESS" if result.success else "FAILED",result.message)
-            # The return label is real state; a low-stock re-shipment can then be safely escalated.
-            if result.success:return self._finalize(state,"wrong_item_return", "A prepaid label was created for the incorrect item; operations will dispatch the correct replacement after return scan.")
-        elif issue=="EXPIRED_RETURN":
-            customer=self._call(state,"GET_CUSTOMER","CustomerService","CustomerService",customer_id=state.customer_id)
-            state.event("GET_CUSTOMER","CustomerService","SUCCESS" if customer.success else "FAILED",customer.message)
-            return self._escalate(state,"Refund window has expired; a human review is required for any exception.")
-        elif issue=="LOST_PARCEL":
-            shipment=self._call(state,"GET_SHIPMENT","ShipmentService","ShipmentService",order_id=state.order_id)
-            state.event("GET_SHIPMENT","ShipmentService","SUCCESS" if shipment.success else "FAILED",shipment.message)
-            return self._escalate(state,"Carrier claim dossier created: delivered scan is disputed beyond 48 hours.")
-        elif issue=="HIGH_VALUE_FRAUD":
-            result=self.enterprise.create_approval_task(state.case_id,"High-value refund exceeds ₹20,000 authorization ceiling")
-            state.event("ESCALATE_HIGH_VALUE","AuthorizationGuard","SUCCESS",result.message)
-            state.current_resolution="human_approval";state.final_status="ESCALATED";state.final_summary="A human-approval task was created because the requested amount exceeds the financial authorization ceiling.";return state
-        return self._escalate(state,"No safe deterministic action exists for this operational case.")
-    def _finalize(self,state: ResolutionState,resolution: str,summary: str)->ResolutionState:
-        from storage.database import connect
-        c=connect(self.enterprise.db_path);c.execute("UPDATE cases SET status='RESOLVED',current_resolution=?,resolution_summary=? WHERE id=?",(resolution.upper(),summary,state.case_id));c.commit();c.close()
-        state.current_resolution=resolution;state.final_status="RESOLVED";state.final_summary=summary;state.event("FINALIZE","CaseService","SUCCESS","Case state resolved after verified operational action.");return state
-    def _escalate(self,state: ResolutionState,reason: str):
-        result=self._call(state,"ESCALATE","ESCALATE","CaseService",case_id=state.case_id,reason=reason);state.event("ESCALATE","CaseService","SUCCESS",result.message);state.current_resolution="escalation";state.final_status="ESCALATED";state.final_summary=f"Your case was escalated for human review: {reason}";return state
-    def _summary(self,state: ResolutionState,data:dict):
-        adapted=" Replacement was unavailable because inventory had no available units, so the agent selected a policy-permitted refund." if state.replans else ""
-        identifier=data.get("refund_id") or data.get("replacement_id")
-        return f"Your {state.current_resolution} was successfully created and verified ({identifier})."+adapted
+                key=(action.tool,result.error_type);failures[key]=failures.get(key,0)+1;state.replans+=1;state.event("ADAPT_PLAN","ResolutionAgent","ADAPTED",f"{action.tool} returned {result.error_type}; provider will re-evaluate the observed state.")
+                if failures[key]>=2:yield self._terminal(state,"ESCALATED","A specialist will review the blocked request.",f"Circuit breaker: {action.tool} repeated the same failure.");return
+                yield state;continue
+            if action.tool in VERIFY_ACTION:state.pending_action=VERIFY_ACTION[action.tool];state.current_resolution=state.pending_action;yield state;continue
+            if action.tool=="VERIFY":
+                state.verification_results.append(result.data);state.pending_action=None;state.event("VERIFY","VerificationService","SUCCESS","Independent verification passed.")
+                status="ACTION_REQUIRED" if state.current_resolution=="return_label" else "ESCALATED" if state.current_resolution=="approval" else "RESOLVED";summary="A prepaid return label was created and verified." if status=="ACTION_REQUIRED" else "A human approval task was created and verified." if status=="ESCALATED" else f"Your {state.current_resolution} was completed and independently verified."
+                combined=state.current_resolution=="duplicate_reversal" and any(word in state.user_request.lower() for word in ("damage","broken","defect","wrong item","missing part","mis-shipped"))
+                if combined:state.event("CONTINUE_INVESTIGATION","ResolutionAgent","SUCCESS","The verified duplicate-charge remedy is complete; investigating the separately reported product issue.");yield state;continue
+                yield self._terminal(state,status,summary,"Authoritative state transition verified.");return
+            yield state
+        self._execute(state,"ESCALATE",{"case_id":state.case_id,"reason":"Turn limit reached without a safe verified resolution"});yield self._terminal(state,"ESCALATED","A specialist will review the investigation.","Turn limit reached without a safe verified resolution.")

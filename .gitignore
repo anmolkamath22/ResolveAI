@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+.venv/
 __pycache__/
 .pytest_cache/
 *.pyc
@@ -8,10 +9,27 @@ resolveai.db
 *.sqlite
 *.pptx
 generate_deck.py
-submission/
+submission/*
+!submission/video_script.md
+!submission/directors_playbook.md
+!submission/ResolveAI_V5_Presentation.pptx
 ResolveAI*Master*Prompt*.md
 Tech_Zephyr_4.0_Agentic_AI_Final_Problem_Statements.pdf
-prompts/
 architecture.png
 architecture.svg
 .DS_Store
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]

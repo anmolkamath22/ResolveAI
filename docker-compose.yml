@@ -1,0 +1,34 @@
+services:
+  api:
+    build: .
+    environment:
+      RESOLVEAI_DATABASE_PATH: /data/resolveai.db
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-3.6-flash}
+    volumes:
+      - resolveai-data:/data
+    ports:
+      - "8000:8000"
+  ui:
+    build: .
+    command: streamlit run app/streamlit_app.py --server.address 0.0.0.0
+    environment:
+      RESOLVEAI_DATABASE_PATH: /data/resolveai.db
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-3.6-flash}
+    volumes:
+      - resolveai-data:/data
+    ports:
+      - "8501:8501"
+  demo:
+    build: ./frontend
+    environment:
+      VITE_RESOLVEAI_API_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+volumes:
+  resolveai-data:
